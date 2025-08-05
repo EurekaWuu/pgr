@@ -1,14 +1,38 @@
+import sys
+sys.path.insert(0, '/mnt/lustre/GPU4/home/wuhanpeng/pgr_raw')
+
 import warnings
 
 warnings.filterwarnings("ignore")
 
-import sys
+# 启动虚拟显示环境
+print("初始化虚拟显示环境...")
+try:
+    from pyvirtualdisplay import Display
+    virtual_display = Display(visible=0, size=(1400, 900))
+    virtual_display.start()
+    import os
+    print(f"虚拟显示已启动，DISPLAY={os.environ.get('DISPLAY')}")
+    # 设置渲染器为GLFW (通常与虚拟显示配合效果最好)
+    os.environ['MUJOCO_GL'] = 'glfw'
+    has_virtual_display = True
+except ImportError:
+    print("警告: pyvirtualdisplay未安装，真实环境渲染可能会失败")
+    print("尝试安装: pip install pyvirtualdisplay")
+    print("并确保安装了系统依赖: apt-get install -y xvfb")
+    has_virtual_display = False
+except Exception as e:
+    print(f"启动虚拟显示时出错: {e}")
+    has_virtual_display = False
+
 import time
+import os
+import os.path as osp
+import numpy as np
 
 import dmcgym
 import gin
 import gym
-import numpy as np
 import torch
 from gym.wrappers.flatten_observation import FlattenObservation
 from redq.algos.core import mbpo_epoches, test_agent
@@ -67,6 +91,17 @@ def redq_sac(
         n_mc_eval=1000,
         n_mc_cutoff=350,
         reseed_each_epoch=True,
+        # model saving parameters
+        save_freq=20,  # 保存频率，每隔多少个epoch保存一次
+        # 视频保存参数
+        save_video=True,  # 是否保存视频
+        save_video_freq=20,  # 保存视频的频率，每隔多少个epoch保存一次
+        video_episodes=1,  # 每次保存多少个episode的视频
+        video_width=640,  # 视频宽度
+        video_height=480,  # 视频高度
+        video_fps=30,  # 视频帧率
+        preferred_renderers=['egl', 'glfw', 'osmesa'],  # 尝试的渲染器列表，按优先级排序
+        force_hardware_acceleration=True,  # 是否强制使用硬件加速
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -248,6 +283,191 @@ def redq_sac(
             returns = test_agent(agent, test_env, max_ep_len, logger, n_evals_per_epoch)  # add logging here
             if evaluate_bias:
                 log_bias_evaluation(bias_eval_env, agent, logger, max_ep_len, alpha, gamma, n_mc_eval, n_mc_cutoff)
+            
+            # 保存策略网络模型（每save_freq个epoch保存一次）
+            if epoch % save_freq == 0 or epoch == epochs - 1:
+                # 创建基础保存目录
+                base_save_dir = '/mnt/lustre/GPU4/home/wuhanpeng/pgr_raw/models'
+                
+                # 获取当前时间戳
+                import datetime
+                timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                
+                # 创建按环境名称和时间戳组织的目录
+                model_save_dir = osp.join(base_save_dir, env_name, timestamp)
+                if not os.path.exists(model_save_dir):
+                    os.makedirs(model_save_dir)
+                
+                # 同时在原始日志目录中也保存一份
+                if not os.path.exists(osp.join(logger.output_dir, 'pyt_save')):
+                    os.makedirs(osp.join(logger.output_dir, 'pyt_save'))
+                
+                # 保存策略网络、Q网络和条件网络
+                model_filename = f'model_ep{epoch}.pt'
+                save_path = osp.join(model_save_dir, model_filename)
+                logger_save_path = osp.join(logger.output_dir, 'pyt_save', model_filename)
+                
+                model_data = {
+                    'epoch': epoch,
+                    'env_name': env_name,
+                    'timestamp': timestamp,
+                    'policy_state_dict': agent.policy_net.state_dict(),
+                    'q_state_dict': [q.state_dict() for q in agent.q_net_list],
+                    'cond_net_state_dict': agent.cond_net.state_dict() if hasattr(agent, 'cond_net') else None
+                }
+                
+                # 保存到两个位置
+                torch.save(model_data, save_path)
+                torch.save(model_data, logger_save_path)
+                
+                print(f"模型已保存至: \n1. {save_path}\n2. {logger_save_path}")
+            
+            # 保存视频（每save_video_freq个epoch保存一次）
+            if save_video and (epoch % save_video_freq == 0 or epoch == epochs - 1):
+                try:
+                    import cv2
+                    print(f"正在记录第{epoch}个epoch的视频...")
+                    
+                    # 创建视频目录
+                    video_dir = osp.join(logger.output_dir, 'videos')
+                    if not os.path.exists(video_dir):
+                        os.makedirs(video_dir)
+                    
+                    # 设置视频文件名和写入器
+                    video_path = osp.join(video_dir, f"{env_name}_ep{epoch}.mp4")
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    video_writer = cv2.VideoWriter(video_path, fourcc, video_fps, 
+                                                 (video_width, video_height))
+                    
+                    # 备份当前环境变量(无论哪种情况都需要)
+                    original_env_vars = os.environ.copy()
+                    
+                    # 尝试不同的渲染器配置
+                    if has_virtual_display:
+                        print("使用已启动的虚拟显示环境进行渲染")
+                        render_success = True
+                    else:
+                        renderers_to_try = preferred_renderers
+                        render_success = False
+                        
+                        # 尝试多种渲染器配置
+                        for renderer in renderers_to_try:
+                            try:
+                                # 设置渲染器
+                                print(f"尝试使用 {renderer} 渲染器...")
+                                os.environ['MUJOCO_GL'] = renderer
+                                
+                                # 如果强制硬件加速，设置相关环境变量
+                                if force_hardware_acceleration and renderer == 'egl':
+                                    os.environ['__EGL_VENDOR_LIBRARY_FILENAMES'] = '/usr/share/glvnd/egl_vendor.d/10_nvidia.json'
+                                    print("已启用NVIDIA EGL硬件加速")
+                                
+                                # 创建临时环境测试渲染
+                                test_frame = None
+                                test_env_copy = wrap_gym(gym.make(env_name))
+                                test_env_copy.reset()
+                                
+                                # 尝试渲染一帧
+                                test_frame = test_env_copy.render(mode='rgb_array', width=video_width, height=video_height)
+                                test_env_copy.close()
+                                
+                                if test_frame is not None and test_frame.size > 0:
+                                    print(f"成功使用 {renderer} 渲染器! 帧大小: {test_frame.shape}")
+                                    render_success = True
+                                    break
+                            except Exception as e:
+                                print(f"{renderer} 渲染器失败: {e}")
+                                import traceback
+                                traceback.print_exc()
+                        
+                        if not render_success:
+                            print("警告: 无法使用任何渲染器。请确保服务器环境支持OpenGL渲染。")
+                            print("尝试安装必要的包: apt-get install -y xvfb mesa-utils libosmesa6-dev libgl1-mesa-glx")
+                            
+                            # 显示系统信息以帮助调试
+                            try:
+                                import subprocess
+                                print("\n系统信息:")
+                                subprocess.run("lspci | grep -i vga", shell=True)
+                                print("\nOpenGL信息:")
+                                if 'DISPLAY' in os.environ:
+                                    subprocess.run("glxinfo | grep OpenGL", shell=True)
+                                else:
+                                    print("未设置DISPLAY环境变量，无法获取OpenGL信息")
+                            except:
+                                print("无法获取系统信息")
+                            
+                            print("如果在Docker中运行，请确保以--gpus参数启动容器")
+                            print("将尝试继续渲染，但可能会失败")
+                    
+                    # 记录视频
+                    for ep in range(video_episodes):
+                        obs = test_env.reset()
+                        done = False
+                        ep_len = 0
+                        ep_ret = 0
+                        
+                        print(f"渲染episode {ep+1}/{video_episodes}...")
+                        
+                        while not done and ep_len < max_ep_len:
+                            # 获取决定性动作
+                            action = agent.get_test_action(obs)
+                            
+                            # 先执行动作获取下一状态和奖励
+                            next_obs, reward, done, _ = test_env.step(action)
+                            ep_ret += reward
+                            
+                            # 尝试渲染并保存帧
+                            try:
+                                frame = test_env.render(mode='rgb_array', width=video_width, height=video_height)
+                                
+                                if frame is not None and frame.size > 0:
+                                    # 添加状态信息到帧上
+                                    frame = frame.copy()  # 创建副本以避免修改原始帧
+                                    
+                                    # 添加文本信息
+                                    info_text = f"Epoch: {epoch}, Step: {ep_len}, Reward: {ep_ret:.2f}"
+                                    cv2.putText(frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                                              0.7, (255, 255, 255), 1, cv2.LINE_AA)
+                                    
+                                    # 转换颜色通道并写入视频
+                                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                                    video_writer.write(frame_bgr)
+                                else:
+                                    raise Exception("渲染帧为空")
+                            except Exception as e:
+                                if ep_len == 0:  # 只在第一步打印错误
+                                    print(f"渲染错误: {e}")
+                                    print("由于无法渲染真实环境，视频将显示空白帧")
+                                
+                                # 创建信息面板作为最后的降级选项
+                                frame = np.zeros((video_height, video_width, 3), dtype=np.uint8)
+                                
+                                # 添加错误消息
+                                cv2.putText(frame, "渲染失败 - 请检查环境配置", 
+                                          (video_width//2-150, video_height//2), 
+                                          cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+                                cv2.putText(frame, f"Epoch: {epoch}, Step: {ep_len}, Reward: {ep_ret:.2f}", 
+                                          (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1, cv2.LINE_AA)
+                                
+                                # 写入帧
+                                video_writer.write(frame)
+                            
+                            ep_len += 1
+                            obs = next_obs
+                    
+                    # 恢复原始环境变量
+                    os.environ.clear()
+                    os.environ.update(original_env_vars)
+                    
+                    # 关闭视频写入器
+                    video_writer.release()
+                    print(f"视频已保存至: {video_path}")
+                
+                except Exception as e:
+                    print(f"保存视频时出错: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             # reseed should improve reproducibility (should make results the same whether bias evaluation is on or not)
             if reseed_each_epoch:
@@ -321,8 +541,24 @@ if __name__ == '__main__':
     parser.add_argument('--gin_params', nargs='*', type=str, default=[])
     args = parser.parse_args()
 
-    logger_kwargs = setup_logger_kwargs(args.env, args.log_dir)
+    logger_kwargs = setup_logger_kwargs(args.env, data_dir=args.log_dir, datestamp=True)
 
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
 
-    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs)
+    try:
+        redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs)
+    except KeyboardInterrupt:
+        print("训练被用户中断")
+    except Exception as e:
+        print(f"训练发生错误: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # 释放虚拟显示资源
+        if 'virtual_display' in globals() and has_virtual_display:
+            try:
+                print("正在关闭虚拟显示...")
+                virtual_display.stop()
+                print("虚拟显示已关闭")
+            except:
+                pass

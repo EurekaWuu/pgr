@@ -1,7 +1,8 @@
 import numpy as np
 import torch
 from redq.algos.core import (ReplayBuffer,
-                             soft_update_model1_with_model2)
+                             soft_update_model1_with_model2,
+                             mbpo_target_entropy_dict)
 from redq.algos.redq_sac import REDQSACAgent
 from synther.online.conditional_nets import Curiosity
 from torch import Tensor
@@ -15,6 +16,17 @@ def combine_two_tensors(tensor1, tensor2):
 class REDQRLPDCondAgent(REDQSACAgent):
 
     def __init__(self, cond_hidden_size, diffusion_buffer_size=int(1e6), diffusion_sample_ratio=0.5, *args, **kwargs):
+        # 确保在调用父类初始化前处理target_entropy
+        env_name = kwargs.get('env_name')
+        target_entropy = kwargs.get('target_entropy')
+        
+        # 如果指定了'mbpo'或'auto'但找不到对应环境名称，就使用动作维度的负值
+        if env_name and target_entropy in ['mbpo', 'auto']:
+            if env_name not in mbpo_target_entropy_dict:
+                act_dim = kwargs.get('act_dim', 1)
+                print(f"警告: 环境 {env_name} 不在mbpo_target_entropy_dict中，使用-{act_dim}作为target_entropy")
+                kwargs['target_entropy'] = -act_dim
+        
         super().__init__(*args, **kwargs)
         self.diffusion_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim, size=diffusion_buffer_size)
         self.diffusion_sample_ratio = diffusion_sample_ratio
@@ -149,4 +161,17 @@ class REDQRLPDCondAgent(REDQSACAgent):
     def reset_diffusion_buffer(self):
         self.diffusion_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim,
                                              size=self.diffusion_buffer.max_size)
+                                             
+    def get_deterministic_action(self, obs):
+        """
+        专门用于视频渲染的确定性动作生成函数
+        确保生成的动作在[-1, 1]范围内
+        """
+        with torch.no_grad():
+            obs_tensor = torch.Tensor(obs).unsqueeze(0).to(self.device)
+            action_tensor = self.policy_net.forward(obs_tensor, deterministic=True)[0]
+            action = action_tensor.cpu().numpy().reshape(-1)
+            # 确保动作在[-1, 1]范围内
+            action = np.clip(action, -1.0, 1.0)
+            return action
 
