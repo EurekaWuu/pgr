@@ -167,7 +167,7 @@ python video.py --env quadruped-walk-v0 --episodes 3
 
 ### Gin配置文件
 
-项目使用Gin配置系统，支持灵活的超参数管理：
+项目使用Gin配置系统，管理超参数：
 
 ```python
 # config/online/sac_cond_synther_dmc.gin
